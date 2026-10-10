@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="GR Scanner">
+<title>GR Scanner</title>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<style>
+  :root {
+    --bg: #f4f4f1; --card: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e2e2dc;
+    --ok: #1f7a4a; --ok-bg: #e6f4ec; --err: #b3261e; --err-bg: #fbe9e7;
+    --warn: #8a5a00; --warn-bg: #fdf3dc; --accent: #1d1d1b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 16px; padding-top: max(16px, env(safe-area-inset-top)); }
+  h1 { font-size: 20px; margin: 4px 0 12px; }
+
+  .cam { position: relative; border-radius: 14px; overflow: hidden; background: #000; aspect-ratio: 1 / 1; }
+  .cam video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* Box matches the tightest crop the decoder reads at full resolution (40% of the frame). */
+  .cam .frame { position: absolute; inset: 30%; border: 3px solid rgba(255,255,255,.9); border-radius: 10px;
+                box-shadow: 0 0 0 9999px rgba(0,0,0,.35); pointer-events: none; transition: border-color .15s; }
+  .cam .frame.hit { border-color: #4ade80; }
+  .start { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .zoom { position: absolute; bottom: 10px; left: 0; right: 0; display: flex; justify-content: center; gap: 6px; }
+  .zoom button { padding: 6px 12px; font-size: 14px; background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.5); }
+  .zoom button.on { background: #fff; color: #000; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 8px; text-align: center; }
+
+  button { appearance: none; border: 0; border-radius: 10px; padding: 12px 16px; font: inherit;
+           font-weight: 600; background: var(--accent); color: #fff; cursor: pointer; }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  input[type=text] { flex: 1; min-width: 0; padding: 12px; font: inherit; border: 1px solid var(--line);
+                     border-radius: 10px; text-transform: uppercase; background: var(--card); }
+
+  .status { margin-top: 12px; padding: 14px; border-radius: 12px; background: var(--card);
+            border: 1px solid var(--line); min-height: 64px; }
+  .status.ok { background: var(--ok-bg); border-color: var(--ok); }
+  .status.err { background: var(--err-bg); border-color: var(--err); }
+  .status.warn { background: var(--warn-bg); border-color: var(--warn); }
+  .status .t { font-weight: 700; font-size: 18px; }
+  .status .s { color: var(--muted); margin-top: 2px; }
+  .status.ok .t { color: var(--ok); } .status.err .t { color: var(--err); } .status.warn .t { color: var(--warn); }
+
+  h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin: 20px 0 8px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; justify-content: space-between; gap: 8px; padding: 10px 12px; background: var(--card);
+       border: 1px solid var(--line); border-radius: 10px; margin-bottom: 6px; font-size: 14px; }
+  li .g { font-weight: 600; font-variant-numeric: tabular-nums; }
+  li .r { color: var(--muted); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li.ok .r { color: var(--ok); } li.err .r { color: var(--err); } li.warn .r { color: var(--warn); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>GR Scanner</h1>
+
+  <div class="cam">
+    <video id="video" playsinline muted autoplay></video>
+    <div class="frame" id="frame" hidden></div>
+    <div class="zoom" id="zoom" hidden></div>
+    <div class="start" id="startWrap"><button id="startBtn">Start scanning</button></div>
+  </div>
+  <div class="hint" id="hint" hidden>Hold the card 10–20 cm away with the QR inside the box.</div>
+
+  <form class="row" id="manual">
+    <input type="text" id="manualInput" placeholder="Or type GR Number" autocomplete="off" maxlength="9">
+    <button type="submit">Add</button>
+  </form>
+
+  <div class="status" id="status">
+    <div class="t">Ready</div>
+    <div class="s">Tap "Start scanning". Each QR is saved the moment it's read.</div>
+  </div>
+
+  <h2>This session</h2>
+  <ul id="log"></ul>
+</main>
+
+<script>
+  // ===== SETUP: paste your values here =====
+  const API_URL = 'https://script.google.com/macros/s/AKfycbz_8_akdGTgUCnJbmfS6WbgSL8OM3Xd3G5UqpNd356InQjvRzNJsrfRXzNlIYyw5R-T/exec';
+  const API_KEY = 'CHANGE-ME-to-a-long-random-key';           // same as API_KEY in Code.gs
+  // =========================================
+
+  const GR_PATTERN = /^NP[MF]\d{6}$/;
+  const video = document.getElementById('video');
+  const frameEl = document.getElementById('frame');
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  let busy = false, scanning = false, lastCode = '', lastTime = 0, audio = null, detector = null, track = null;
+
+  // Centre crops of the frame, cycled one per video frame. Each is resized (with smoothing) to a
+  // fixed size before decoding. Tight crops enlarged = small card QRs; wide crops = big codes.
+  // [fraction of the frame's short side, output size in px] — tuned by testing 60–450px codes
+  // at 720p and 1080p with blur and sensor noise.
+  const CROPS = [[0.25, 480], [0.4, 720], [0.7, 900], [1.0, 1080]];
+  let cropIndex = 0;
+
+  // ---------- Camera ----------
+  document.getElementById('startBtn').addEventListener('click', startCamera);
+
+  async function startCamera() {
+    try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+    try {
+      // Ask for full HD. Without this, iPhone Safari defaults to 640x480 and small QRs blur out.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      });
+      video.srcObject = stream;
+      await video.play();
+      track = stream.getVideoTracks()[0];
+      await tuneTrack();
+      await setupNativeDetector();
+      document.getElementById('startWrap').hidden = true;
+      frameEl.hidden = false;
+      document.getElementById('hint').hidden = false;
+      setStatus('', 'Scanning…', 'Point at a QR code.');
+      scanning = true;
+      loop();
+    } catch (e) {
+      setStatus('err', 'Camera unavailable',
+        (e && e.name === 'NotAllowedError')
+          ? 'Camera permission was denied. Allow it in Safari: aA → Website Settings → Camera.'
+          : 'Could not start the camera (' + (e && e.message ? e.message : e) + ').');
+    }
+  }
+
+  // Continuous autofocus and a zoom control, where the phone's browser supports them.
+  async function tuneTrack() {
+    if (!track || !track.getCapabilities) return;
+    const caps = track.getCapabilities();
+    try {
+      if (caps.focusMode && caps.focusMode.includes('continuous')) {
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+      }
+    } catch (e) {}
+    if (caps.zoom && caps.zoom.max > 1) {
+      const box = document.getElementById('zoom');
+      const levels = [1, 2, 3].filter((z) => z >= caps.zoom.min && z <= caps.zoom.max);
+      levels.forEach((z) => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = z + '×';
+        if (z === 1) b.className = 'on';
+        b.addEventListener('click', async () => {
+          try { await track.applyConstraints({ advanced: [{ zoom: z }] }); } catch (e) {}
+          box.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+        });
+        box.appendChild(b);
+      });
+      if (levels.length > 1) box.hidden = false;
+    }
+  }
+
+  // Android Chrome has a built-in QR reader that is faster and better at small codes.
+  // iPhone Safari doesn't, so it uses jsQR on cropped frames instead.
+  async function setupNativeDetector() {
+    if (!('BarcodeDetector' in window)) return;
+    try {
+      const formats = await BarcodeDetector.getSupportedFormats();
+      if (formats.includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] });
+    } catch (e) { detector = null; }
+  }
+
+  async function loop() {
+    if (!scanning) return;
+    if (!busy && video.readyState >= video.HAVE_ENOUGH_DATA) {
+      try {
+        const text = await readFrame();
+        if (text) handle(text);
+      } catch (e) {}
+    }
+    requestAnimationFrame(loop);
+  }
+
+  async function readFrame() {
+    if (detector) {
+      const codes = await detector.detect(video);
+      if (codes.length) return codes[0].rawValue;
+    }
+    if (typeof jsQR !== 'function') return null;
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const [f, out] = CROPS[cropIndex];
+    cropIndex = (cropIndex + 1) % CROPS.length;
+    const side = Math.round(Math.min(vw, vh) * f);
+    const sx = Math.round((vw - side) / 2), sy = Math.round((vh - side) / 2);
+    canvas.width = out; canvas.height = out;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(video, sx, sy, side, side, 0, 0, out, out);
+    const img = ctx.getImageData(0, 0, out, out);
+    const code = jsQR(img.data, out, out, { inversionAttempts: 'dontInvert' });
+    return code && code.data ? code.data : null;
+  }
+
+  // ---------- Manual entry ----------
+  document.getElementById('manual').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = document.getElementById('manualInput');
+    if (!input.value.trim()) return;
+    lastCode = '';
+    handle(input.value);
+    input.value = '';
+  });
+
+  // ---------- Submit ----------
+  async function handle(text) {
+    const gr = String(text).trim().toUpperCase();
+    const now = Date.now();
+    if (gr === lastCode && now - lastTime < 4000) return;   // the same card held in view
+    lastCode = gr; lastTime = now;
+
+    flashFrame();
+    if (!GR_PATTERN.test(gr)) {                              // instant reject, no network call
+      setStatus('err', gr.slice(0, 40) || 'Unreadable', 'Not a GR Number. Expected NP + M/F + 6 digits.');
+      addLog('err', gr.slice(0, 14), 'Invalid');
+      beep(false);
+      return;
+    }
+
+    busy = true;
+    setStatus('', gr, 'Saving…');
+    try {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },  // text/plain avoids a CORS preflight
+        body: JSON.stringify({ key: API_KEY, gr: gr })
+      });
+      render(await res.json());
+    } catch (err) {
+      setStatus('err', gr, 'Could not reach the sheet. Check internet, API_URL and deployment access.');
+      addLog('err', gr, 'Network error');
+      beep(false);
+    } finally {
+      setTimeout(() => { busy = false; }, 1200);
+    }
+  }
+
+  function render(res) {
+    const d = res.details;
+    const where = d ? [d.area, d.satsangPoint].filter(Boolean).join(' · ') : '';
+    const who = d ? [d.name, where].filter(Boolean).join(' — ') : '';
+    if (res.ok) {
+      setStatus('ok', res.gr + ' saved', (who ? who + ' · ' : '') + 'Row ' + res.row);
+      addLog('ok', res.gr, d && d.name ? d.name : 'Row ' + res.row);
+      beep(true);
+    } else if (res.duplicate) {
+      setStatus('warn', res.gr + ' already entered', (who ? who + ' · ' : '') + 'Row ' + res.row);
+      addLog('warn', res.gr, 'Duplicate');
+      beep(false);
+    } else {
+      setStatus('err', res.gr || 'Rejected', res.reason || 'Rejected.');
+      addLog('err', res.gr || '—', 'Rejected');
+      beep(false);
+    }
+  }
+
+  // ---------- UI helpers ----------
+  function setStatus(kind, title, sub) {
+    const el = document.getElementById('status');
+    el.className = 'status' + (kind ? ' ' + kind : '');
+    el.innerHTML = '';
+    const t = document.createElement('div'); t.className = 't'; t.textContent = title;
+    const s = document.createElement('div'); s.className = 's'; s.textContent = sub || '';
+    el.append(t, s);
+  }
+
+  function addLog(kind, gr, note) {
+    const li = document.createElement('li'); li.className = kind;
+    const g = document.createElement('span'); g.className = 'g'; g.textContent = gr;
+    const r = document.createElement('span'); r.className = 'r'; r.textContent = note;
+    li.append(g, r);
+    document.getElementById('log').prepend(li);
+  }
+
+  function flashFrame() {
+    frameEl.classList.add('hit');
+    setTimeout(() => frameEl.classList.remove('hit'), 400);
+    if (navigator.vibrate) navigator.vibrate(60);
+  }
+
+  function beep(good) {
+    if (!audio) return;
+    try {
+      if (audio.state === 'suspended') audio.resume();
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.frequency.value = good ? 1200 : 300;
+      g.gain.value = 0.15;
+      o.connect(g); g.connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + (good ? 0.12 : 0.35));
+    } catch (e) {}
+  }
+</script>
+</body>
+</html>
